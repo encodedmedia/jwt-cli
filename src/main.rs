@@ -10,7 +10,11 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty, Value};
 use std::collections::BTreeMap;
 use std::process::exit;
-use std::{fs, io};
+use std::{fs, io, str};
+use std::path::Path;
+use std::ffi::OsStr;
+
+use jsonwebkey::{JsonWebKey};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct PayloadItem(String, Value);
@@ -47,6 +51,12 @@ arg_enum! {
     enum SupportedTypes {
         JWT
     }
+}
+
+enum KeyFormat {
+    PEM,
+    DER,
+    JWK
 }
 
 #[derive(Debug, PartialEq)]
@@ -237,11 +247,18 @@ fn config_options<'a, 'b>() -> App<'a, 'b> {
                         .long("no-iat")
                 ).arg(
                     Arg::with_name("secret")
-                        .help("the secret to sign the JWT with. Can be prefixed with @ to read from a binary file")
+                        .help("the secret to sign the JWT with. Can be prefixed with @ to read from a file")
                         .takes_value(true)
                         .long("secret")
                         .short("S")
                         .required(true),
+                ).arg(
+                    Arg::with_name("keyformat")
+                        .help("the format of the secret param or file: pem|der|jwk are supported. Default: pem")
+                        .takes_value(true)
+                        .long("keyformat")
+                        .short("f")
+                        .required(false),
                 ),
         ).subcommand(
             SubCommand::with_name("decode")
@@ -339,35 +356,61 @@ fn slurp_file(file_name: &str) -> Vec<u8> {
     fs::read(file_name).unwrap_or_else(|_| panic!("Unable to read file {}", file_name))
 }
 
-fn encoding_key_from_secret(alg: &Algorithm, secret_string: &str) -> JWTResult<EncodingKey> {
+fn encoding_key_from_secret(alg: &Algorithm, secret_string: &str, formatopt: Option<&str>) -> JWTResult<EncodingKey> {
+    let secret = 
+        if secret_string.starts_with('@') {
+            slurp_file(&secret_string.chars().skip(1).collect::<String>())
+        } else {
+            secret_string.as_bytes().to_vec()
+        };        
+    
+    let format = 
+        match formatopt {
+            None => {
+                if secret_string.starts_with('@'){
+                    match Path::new(secret_string).extension().and_then(OsStr::to_str) {
+                        Some("pem") | Some("cer") | Some("key") => KeyFormat::PEM,
+                        Some("der") => KeyFormat::DER,
+                        Some("jwk") => KeyFormat::JWK,
+                        _ => KeyFormat::PEM
+                    }
+                } else {
+                    KeyFormat::PEM
+                }
+            }
+            Some("pem") => KeyFormat::PEM,
+            Some("der") => KeyFormat::DER,
+            Some("jwk") => KeyFormat::JWK,
+            Some(_) => KeyFormat::PEM
+        };
+
     match alg {
         Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
-            if secret_string.starts_with('@') {
-                let secret = slurp_file(&secret_string.chars().skip(1).collect::<String>());
-                Ok(EncodingKey::from_secret(&secret))
-            } else {
-                Ok(EncodingKey::from_secret(secret_string.as_bytes()))
-            }
+            Ok(EncodingKey::from_secret(&secret))            
         }
         Algorithm::RS256
         | Algorithm::RS384
         | Algorithm::RS512
         | Algorithm::PS256
         | Algorithm::PS384
-        | Algorithm::PS512 => {
-            let secret = slurp_file(&secret_string.chars().skip(1).collect::<String>());
-
-            match secret_string.ends_with(".pem") {
-                true => EncodingKey::from_rsa_pem(&secret),
-                false => Ok(EncodingKey::from_rsa_der(&secret)),
+        | Algorithm::PS512 => {            
+            match format {
+                KeyFormat::PEM => EncodingKey::from_rsa_pem(&secret),
+                KeyFormat::DER => Ok(EncodingKey::from_rsa_der(&secret)),
+                KeyFormat::JWK => {
+                    let jwk: JsonWebKey = str::from_utf8(&secret).unwrap().parse().unwrap();
+                    EncodingKey::from_rsa_pem(&jwk.key.to_pem().as_bytes())
+                }
             }
         }
-        Algorithm::ES256 | Algorithm::ES384 => {
-            let secret = slurp_file(&secret_string.chars().skip(1).collect::<String>());
-
-            match secret_string.ends_with(".pem") {
-                true => EncodingKey::from_ec_pem(&secret),
-                false => Ok(EncodingKey::from_ec_der(&secret)),
+        Algorithm::ES256 | Algorithm::ES384 => {        
+            match format {
+                KeyFormat::PEM => EncodingKey::from_ec_pem(&secret),
+                KeyFormat::DER => Ok(EncodingKey::from_ec_der(&secret)),
+                KeyFormat::JWK => {
+                    let jwk: JsonWebKey = str::from_utf8(&secret).unwrap().parse().unwrap();
+                    EncodingKey::from_ec_pem(&jwk.key.to_pem().as_bytes())
+                }
             }
         }
     }
@@ -469,7 +512,7 @@ fn encode_token(matches: &ArgMatches) -> JWTResult<String> {
     let payloads = maybe_payloads.into_iter().flatten().collect();
     let Payload(claims) = Payload::from_payloads(payloads);
 
-    encoding_key_from_secret(&algorithm, matches.value_of("secret").unwrap())
+    encoding_key_from_secret(&algorithm, matches.value_of("secret").unwrap(), matches.value_of("keyformat"))
         .and_then(|secret| encode(&header, &claims, &secret))
 }
 
