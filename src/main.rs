@@ -297,6 +297,13 @@ fn config_options<'a, 'b>() -> App<'a, 'b> {
                     Arg::with_name("ignore_exp")
                         .help("Ignore token expiration date (`exp` claim) during validation.")
                         .long("ignore-exp")
+                ).arg(
+                    Arg::with_name("keyformat")
+                        .help("the format of the secret param or file: pem|der|jwk are supported. Default: pem")
+                        .takes_value(true)
+                        .long("keyformat")
+                        .short("f")
+                        .required(false),
                 ),
         )
 }
