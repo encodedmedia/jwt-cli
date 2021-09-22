@@ -1,11 +1,12 @@
 use atty::Stream;
 use chrono::{TimeZone, Utc};
 use clap::{arg_enum, crate_authors, crate_version, App, Arg, ArgMatches, SubCommand};
-use jsonwebtoken::errors::{ErrorKind, Result as JWTResult};
+use jsonwebtoken::errors::{Error, ErrorKind, Result as JWTResult};
 use jsonwebtoken::{
     dangerous_insecure_decode, decode, encode, Algorithm, DecodingKey, EncodingKey, Header,
     TokenData, Validation,
 };
+
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty, Value};
 use std::collections::BTreeMap;
@@ -283,7 +284,7 @@ fn config_options<'a, 'b>() -> App<'a, 'b> {
                         .long("iso8601")
                 ).arg(
                     Arg::with_name("secret")
-                        .help("the secret to validate the JWT with. Can be prefixed with @ to read from a binary file")
+                        .help("the secret to validate the JWT with. Can be prefixed with @ to read from a file")
                         .takes_value(true)
                         .long("secret")
                         .short("S")
@@ -426,15 +427,61 @@ fn encoding_key_from_secret(alg: &Algorithm, secret_string: &str, formatopt: Opt
 fn decoding_key_from_secret(
     alg: &Algorithm,
     secret_string: &str,
+    formatopt: Option<&str>,
+    kid: Option<&String>
 ) -> JWTResult<DecodingKey<'static>> {
+    let secret = 
+        if secret_string.starts_with('@') {
+            slurp_file(&secret_string.chars().skip(1).collect::<String>())
+        } else {
+            secret_string.as_bytes().to_vec()
+        };        
+    
+    let format = 
+        match formatopt {
+            None => {
+                if secret_string.starts_with('@'){
+                    match Path::new(secret_string).extension().and_then(OsStr::to_str) {
+                        Some("pem") | Some("cer") | Some("key") => KeyFormat::PEM,
+                        Some("der") => KeyFormat::DER,
+                        Some("jwk") => KeyFormat::JWK,
+                        _ => KeyFormat::PEM
+                    }
+                } else {
+                    KeyFormat::PEM
+                }
+            }
+            Some("pem") => KeyFormat::PEM,
+            Some("der") => KeyFormat::DER,
+            Some("jwk") => KeyFormat::JWK,
+            Some(_) => KeyFormat::PEM
+        };
+    
+    let selected_key = match (&format, kid) {
+        (KeyFormat::JWK, Some(kid)) => {
+            let obj: Value = serde_json::from_str(str::from_utf8(&secret).unwrap())?;            
+            match &obj["keys"] {                
+                Value::Array(ar) => {
+                    match ar.iter().find(|x| match &x["kid"] {
+                        Value::String(s) => kid.eq(s),
+                        _ => false
+                    }) {
+                        Some(kobj) => {                            
+                            Some(serde_json::to_string(&kobj)?)
+                        },
+                        _ => return Err(Error::from(ErrorKind::InvalidSignature))
+                    }
+                }                        
+                _ => Some(String::from_utf8(secret.clone())?),
+            }
+        },
+        _ => None
+    };
+
+    
     match alg {
         Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
-            if secret_string.starts_with('@') {
-                let secret = slurp_file(&secret_string.chars().skip(1).collect::<String>());
-                Ok(DecodingKey::from_secret(&secret).into_static())
-            } else {
-                Ok(DecodingKey::from_secret(secret_string.as_bytes()).into_static())
-            }
+            Ok(DecodingKey::from_secret(&secret).into_static())            
         }
         Algorithm::RS256
         | Algorithm::RS384
@@ -442,19 +489,23 @@ fn decoding_key_from_secret(
         | Algorithm::PS256
         | Algorithm::PS384
         | Algorithm::PS512 => {
-            let secret = slurp_file(&secret_string.chars().skip(1).collect::<String>());
-
-            match secret_string.ends_with(".pem") {
-                true => DecodingKey::from_rsa_pem(&secret).map(DecodingKey::into_static),
-                false => Ok(DecodingKey::from_rsa_der(&secret).into_static()),
-            }
+            match format {
+                KeyFormat::PEM => DecodingKey::from_rsa_pem(&secret).map(DecodingKey::into_static),
+                KeyFormat::DER => Ok(DecodingKey::from_rsa_der(&secret).into_static()),
+                KeyFormat::JWK => {
+                    let jwk: JsonWebKey = selected_key.unwrap().parse().unwrap();
+                    DecodingKey::from_rsa_pem(&jwk.key.to_pem().as_bytes()).map(DecodingKey::into_static)
+                }
+            }            
         }
         Algorithm::ES256 | Algorithm::ES384 => {
-            let secret = slurp_file(&secret_string.chars().skip(1).collect::<String>());
-
-            match secret_string.ends_with(".pem") {
-                true => DecodingKey::from_ec_pem(&secret).map(DecodingKey::into_static),
-                false => Ok(DecodingKey::from_ec_der(&secret).into_static()),
+            match format {
+                KeyFormat::PEM => DecodingKey::from_ec_pem(&secret).map(DecodingKey::into_static),
+                KeyFormat::DER => Ok(DecodingKey::from_ec_der(&secret).into_static()),
+                KeyFormat::JWK => {
+                    let jwk: JsonWebKey = selected_key.unwrap().parse().unwrap();
+                    DecodingKey::from_ec_pem(&jwk.key.to_pem().as_bytes()).map(DecodingKey::into_static)                    
+                }
             }
         }
     }
@@ -533,10 +584,7 @@ fn decode_token(
     let algorithm = translate_algorithm(SupportedAlgorithms::from_string(
         matches.value_of("algorithm").unwrap(),
     ));
-    let secret = match matches.value_of("secret").map(|s| (s, !s.is_empty())) {
-        Some((secret, true)) => Some(decoding_key_from_secret(&algorithm, secret)),
-        _ => None,
-    };
+    
     let jwt = matches
         .value_of("jwt")
         .map(|value| {
@@ -571,17 +619,35 @@ fn decode_token(
         token
     });
 
+    let kid = match &token_data{
+        Ok(token) => match &token.header.kid{
+            Some(kid) => Some(kid),
+            _ => None
+        },
+        _ => None
+    };
+
+    let ofmt = if matches.is_present("json") {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    };
+
+    let secret = match matches.value_of("secret").map(|s| (s, !s.is_empty())) {
+        Some((secret, true)) => match decoding_key_from_secret(&algorithm, secret, matches.value_of("keyformat"), kid) {
+            Ok(val) => Some(val),
+            Err(kind) => return (Err(kind), token_data, ofmt)
+        },
+        _ => None,
+    };
+
     (
         match secret {
-            Some(secret_key) => decode::<Payload>(&jwt, &secret_key.unwrap(), &secret_validator),
+            Some(secret_key) => decode::<Payload>(&jwt, &secret_key, &secret_validator),
             None => dangerous_insecure_decode::<Payload>(&jwt),
         },
         token_data,
-        if matches.is_present("json") {
-            OutputFormat::Json
-        } else {
-            OutputFormat::Text
-        },
+        ofmt,
     )
 }
 
