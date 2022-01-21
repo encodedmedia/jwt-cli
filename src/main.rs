@@ -163,7 +163,7 @@ impl TokenOutput {
 
 fn config_options<'a, 'b>() -> App<'a, 'b> {
     App::new("jwt")
-        .about("Encode and decode JWTs from the command line. RSA and ECDSA encryption currently only supports keys in DER format")
+        .about("Encode and decode JWTs from the command line. Keys can be in PEM/DER/JWK.")
         .version(crate_version!())
         .author(crate_authors!())
         .subcommand(
